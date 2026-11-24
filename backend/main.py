@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Optional
 import secrets
@@ -6,6 +7,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 app = FastAPI(title="API Clínica - Login e Agendamentos")
 
@@ -19,33 +22,92 @@ app.add_middleware(
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-# --- BANCO DE DADOS EM MEMÓRIA ---
-users_db = {
-    "admin": "1234",
-    "recepcao": "1234",
-}
+# --- CONFIGURAÇÃO DO BANCO DE DADOS (NEON POSTGRESQL / SQLITE LOCAL) ---
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./clinica.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-active_tokens = {}
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
-consultas_db = [
-    {
-        "id": 1,
-        "paciente": "Maria Oliveira",
-        "contato": "(75) 99911-2233",
-        "medico": "Dr. Roberto Lima - Clínico Geral",
-        "data_hora": "2026-11-23T14:00",
-        "status": "Confirmada",
-    },
-    {
-        "id": 2,
-        "paciente": "João Pedro Santos",
-        "contato": "(75) 98844-5566",
-        "medico": "Dra. Ana Paula - Cardiologia",
-        "data_hora": "2026-11-23T15:30",
-        "status": "Agendada",
-    },
-]
-next_consulta_id = 3
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# --- MODELOS DAS TABELAS SQL ---
+class UsuarioDB(Base):
+    __tablename__ = "usuarios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    password = Column(String, nullable=False)
+
+
+class TokenDB(Base):
+    __tablename__ = "tokens"
+
+    token = Column(String, primary_key=True, index=True)
+    username = Column(String, nullable=False)
+
+
+class ConsultaDB(Base):
+    __tablename__ = "consultas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    paciente = Column(String, nullable=False)
+    contato = Column(String, nullable=False)
+    medico = Column(String, nullable=False)
+    data_hora = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+
+
+# Cria as tabelas automaticamente no Neon se ainda não existirem
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def inicializar_dados():
+    db = SessionLocal()
+    try:
+        if db.query(UsuarioDB).count() == 0:
+            db.add_all([
+                UsuarioDB(username="admin", password="1234"),
+                UsuarioDB(username="recepcao", password="1234"),
+            ])
+            db.add_all([
+                ConsultaDB(
+                    paciente="Maria Oliveira",
+                    contato="(75) 99911-2233",
+                    medico="Dr. Roberto Lima - Clínico Geral",
+                    data_hora="2026-11-23T14:00",
+                    status="Confirmada",
+                ),
+                ConsultaDB(
+                    paciente="João Pedro Santos",
+                    contato="(75) 98844-5566",
+                    medico="Dra. Ana Paula - Cardiologia",
+                    data_hora="2026-11-23T15:30",
+                    status="Agendada",
+                ),
+            ])
+            db.commit()
+    finally:
+        db.close()
+
+
+inicializar_dados()
 
 
 # --- SCHEMAS ---
@@ -63,70 +125,87 @@ class ConsultaSchema(BaseModel):
 
 
 # --- AUTENTICAÇÃO ---
-def verificar_token(authorization: Optional[str] = Header(None)):
+def verificar_token(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token ausente ou inválido")
 
     token = authorization.split(" ")[1]
-    username = active_tokens.get(token)
+    sessao = db.query(TokenDB).filter(TokenDB.token == token).first()
 
-    if not username:
+    if not sessao:
         raise HTTPException(status_code=401, detail="Sessão expirada ou inválida")
 
-    return username
+    return sessao.username
 
 
 @app.post("/register", status_code=201)
-def register(user: UserSchema):
+def register(user: UserSchema, db: Session = Depends(get_db)):
     username = user.username.strip()
     if not username or not user.password:
         raise HTTPException(status_code=400, detail="Usuário e senha são obrigatórios")
 
-    if username in users_db:
+    usuario_existente = db.query(UsuarioDB).filter(UsuarioDB.username == username).first()
+    if usuario_existente:
         raise HTTPException(status_code=400, detail="Este usuário já existe")
 
-    users_db[username] = user.password
+    novo_usuario = UsuarioDB(username=username, password=user.password)
+    db.add(novo_usuario)
+    db.commit()
     return {"message": "Usuário cadastrado com sucesso"}
 
 
 @app.post("/login")
-def login(user: UserSchema):
-    senha_salva = users_db.get(user.username)
-    if not senha_salva or senha_salva != user.password:
+def login(user: UserSchema, db: Session = Depends(get_db)):
+    usuario_salvo = db.query(UsuarioDB).filter(UsuarioDB.username == user.username).first()
+    if not usuario_salvo or usuario_salvo.password != user.password:
         raise HTTPException(status_code=401, detail="Usuário ou senha incorretos")
 
     token = secrets.token_hex(16)
-    active_tokens[token] = user.username
+    db.add(TokenDB(token=token, username=user.username))
+    db.commit()
     return {"token": token, "username": user.username}
 
 
 @app.post("/logout")
-def logout(authorization: Optional[str] = Header(None)):
+def logout(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ")[1]
-        active_tokens.pop(token, None)
+        db.query(TokenDB).filter(TokenDB.token == token).delete()
+        db.commit()
     return {"message": "Logout realizado"}
 
 
 # --- CRUD DE CONSULTAS DA CLÍNICA ---
 @app.get("/consultas")
-def listar_consultas(usuario: str = Depends(verificar_token)):
-    return consultas_db
+def listar_consultas(
+    usuario: str = Depends(verificar_token),
+    db: Session = Depends(get_db),
+):
+    return db.query(ConsultaDB).order_by(ConsultaDB.id.asc()).all()
 
 
 @app.post("/consultas", status_code=201)
-def criar_consulta(consulta: ConsultaSchema, usuario: str = Depends(verificar_token)):
-    global next_consulta_id
-    nova_consulta = {
-        "id": next_consulta_id,
-        "paciente": consulta.paciente,
-        "contato": consulta.contato,
-        "medico": consulta.medico,
-        "data_hora": consulta.data_hora,
-        "status": consulta.status,
-    }
-    consultas_db.append(nova_consulta)
-    next_consulta_id += 1
+def criar_consulta(
+    consulta: ConsultaSchema,
+    usuario: str = Depends(verificar_token),
+    db: Session = Depends(get_db),
+):
+    nova_consulta = ConsultaDB(
+        paciente=consulta.paciente,
+        contato=consulta.contato,
+        medico=consulta.medico,
+        data_hora=consulta.data_hora,
+        status=consulta.status,
+    )
+    db.add(nova_consulta)
+    db.commit()
+    db.refresh(nova_consulta)
     return nova_consulta
 
 
@@ -135,25 +214,35 @@ def atualizar_consulta(
     consulta_id: int,
     consulta_atualizada: ConsultaSchema,
     usuario: str = Depends(verificar_token),
+    db: Session = Depends(get_db),
 ):
-    for item in consultas_db:
-        if item["id"] == consulta_id:
-            item["paciente"] = consulta_atualizada.paciente
-            item["contato"] = consulta_atualizada.contato
-            item["medico"] = consulta_atualizada.medico
-            item["data_hora"] = consulta_atualizada.data_hora
-            item["status"] = consulta_atualizada.status
-            return item
-    raise HTTPException(status_code=404, detail="Consulta não encontrada")
+    item = db.query(ConsultaDB).filter(ConsultaDB.id == consulta_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+    item.paciente = consulta_atualizada.paciente
+    item.contato = consulta_atualizada.contato
+    item.medico = consulta_atualizada.medico
+    item.data_hora = consulta_atualizada.data_hora
+    item.status = consulta_atualizada.status
+    db.commit()
+    db.refresh(item)
+    return item
 
 
 @app.delete("/consultas/{consulta_id}")
-def deletar_consulta(consulta_id: int, usuario: str = Depends(verificar_token)):
-    for index, item in enumerate(consultas_db):
-        if item["id"] == consulta_id:
-            consultas_db.pop(index)
-            return {"message": "Agendamento removido com sucesso"}
-    raise HTTPException(status_code=404, detail="Consulta não encontrada")
+def deletar_consulta(
+    consulta_id: int,
+    usuario: str = Depends(verificar_token),
+    db: Session = Depends(get_db),
+):
+    item = db.query(ConsultaDB).filter(ConsultaDB.id == consulta_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+    db.delete(item)
+    db.commit()
+    return {"message": "Agendamento removido com sucesso"}
 
 
 # --- SERVIR FRONTEND ---
